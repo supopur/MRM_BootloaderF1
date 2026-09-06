@@ -226,7 +226,8 @@ void PreSystemInit(void)
 {
 	if( *(MAGIC_ADDR) == MAGIC_VAL ) {
 		*(MAGIC_ADDR) = 0;
-		__set_MSP(*(APP_BASE));
+		uint32_t sp = *(APP_BASE);
+		asm volatile ("MSR msp, %0" : : "r" (sp) : );
 		uint32_t app = *(APP_BASE + 1); // +1 = 4 bytes since uint32_t
 		asm("bx %0\n"::"r" (app):);
 	}

@@ -14,23 +14,20 @@ void can_init(uint16_t br)
 	GPIO_InitTypeDef iotd;
 
 	// configure CAN1 IOs
-	RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO | RCC_APB2Periph_GPIOB, ENABLE);
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
 
 	// configure CAN1 RX pin
-	iotd.GPIO_Pin = GPIO_Pin_8;
+	iotd.GPIO_Pin = GPIO_Pin_11;
 	iotd.GPIO_Mode = GPIO_Mode_IPU;
-	GPIO_Init(GPIOB, &iotd);
+	GPIO_Init(GPIOA, &iotd);
 
 	// configure CAN1 TX pin
-	iotd.GPIO_Pin = GPIO_Pin_9;
+	iotd.GPIO_Pin = GPIO_Pin_12;
 	iotd.GPIO_Mode = GPIO_Mode_AF_PP;
 	iotd.GPIO_Speed = GPIO_Speed_50MHz;
-	GPIO_Init(GPIOB, &iotd);
+	GPIO_Init(GPIOA, &iotd);
 
-	// remap CAN1 GPIOs to GPIOB
-	GPIO_PinRemapConfig(GPIO_Remap1_CAN1, ENABLE);
-
-	// CAN1 periph clocks enable
+	// CAN1 peripheral clock
 	RCC_APB1PeriphClockCmd(RCC_APB1Periph_CAN1, ENABLE);
 
 	// CAN1 register init

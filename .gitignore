@@ -8,3 +8,5 @@
 *.elf
 *.hex
 *.bin
+build
+.idea
