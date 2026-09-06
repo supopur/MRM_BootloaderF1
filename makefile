@@ -13,6 +13,7 @@ BUILDDIR=build/product_$(PRODUCT_TYPE)
 # a sender puts in OTA_OP_INFO, or this device will reject the update -
 # keeps product A from accepting product B's firmware on a shared bus.
 # Override per product, e.g.: make PRODUCT_TYPE=2
+# generic lighthead by default
 PRODUCT_TYPE=1
 
 # STM32 stdperiph lib defines

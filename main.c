@@ -55,8 +55,8 @@ blcan
 //  Defines
 //-----------------------------------------------------------------------------
 
-#define LED_PORT GPIOC
-#define LED_PIN GPIO_Pin_13
+#define LED_PORT GPIOB
+#define LED_PIN GPIO_Pin_8
 
 #define TMR_ID_DELAY 0
 #define TMR_ID_LED 1
@@ -113,7 +113,9 @@ static const uint16_t PAGE_COUNT = 64 - 8;
 #define OTA_ERR_INCOMPLETE 5 // END received before all pages were received
 #define OTA_ERR_CRC        6 // final image CRC does not match
 #define OTA_ERR_FLASH      7 // erase/program/verify failed
+#define OTA_ERR_SEQ        8 // seq mismatch - resend from Data[3]
 
+//IN SECONDS!
 static const uint32_t NOCANRX_TO = 5;
 
 //-----------------------------------------------------------------------------
@@ -134,6 +136,7 @@ static uint16_t page_off;    // bytes filled in pagebuf so far
 static uint8_t cur_page;     // next page index to write
 static uint8_t total_pages;  // expected page count for this update (from INFO)
 static uint8_t ota_active;   // set once a valid INFO has been received
+static uint8_t expected_seq;
 
 //-----------------------------------------------------------------------------
 //  newlib required functions
@@ -277,6 +280,20 @@ void PreSystemInit(void)
 //  OTA update handling
 //-----------------------------------------------------------------------------
 
+static void ota_nack_seq(uint8_t op, uint8_t err, uint8_t want_seq)
+{
+	CanTxMsg m;
+	m.StdId = CAN_MK_ID(CAN_ADDR_BROADCAST, CAN_MSGTYPE_SLAVE_OUT);
+	m.IDE = CAN_Id_Standard;
+	m.RTR = CAN_RTR_Data;
+	m.DLC = 4;
+	m.Data[0] = have_addr ? my_addr : CAN_ADDR_BROADCAST;
+	m.Data[1] = op;
+	m.Data[2] = err;
+	m.Data[3] = want_seq;
+	can_tx(&m);
+}
+
 static void ota_ack(uint8_t op, uint8_t err)
 {
 	CanTxMsg m;
@@ -296,6 +313,7 @@ static void ota_reset(void)
 	page_off = 0;
 	cur_page = 0;
 	total_pages = 0;
+	expected_seq = 0;
 }
 
 // erases+programs flash page cur_page from pagebuf (nwords words), advances
@@ -339,25 +357,40 @@ void process_ota_msg(CanRxMsg* msg)
 	}
 
 	if( op == OTA_OP_DATA ) {
-		if( !ota_active ) return; // not participating in this update - stay silent
+		if( !ota_active ) return;
+		if( msg->DLC < 2 ) return;
+
+		uint8_t seq = msg->Data[1];
+		if( seq != expected_seq ) {
+			GPIO_SetBits(GPIOB, GPIO_Pin_9);
+			ota_nack_seq(op, OTA_ERR_SEQ, expected_seq); // tell sender what we actually need
+			return; // NOTE: no ota_reset() here - state is preserved, we just wait
+		}
+		GPIO_ResetBits(GPIOB, GPIO_Pin_9);
+		++expected_seq;
+
 		if( cur_page >= total_pages ) {
-			ota_ack(op, OTA_ERR_OVERFLOW);
+			ota_ack(op, OTA_ERR_OVERFLOW); // this one's a real, unrecoverable error - reset stands
 			ota_reset();
 			return;
 		}
 
-		uint8_t n = msg->DLC - 1;
+		uint8_t n = msg->DLC - 2;
 		uint8_t* pb8 = (uint8_t*)pagebuf;
 		uint8_t i;
 		for( i = 0; i < n; ++i ) {
-			if( page_off >= PAGE_BYTES ) break; // ignore stray extra bytes
-			pb8[page_off++] = msg->Data[1 + i];
-		}
-
-		if( page_off >= PAGE_BYTES ) {
-			if( !ota_flush_page(PAGE_WORDS) ) {
-				ota_ack(op, OTA_ERR_FLASH);
+			if( cur_page >= total_pages ) {
+				ota_ack(op, OTA_ERR_OVERFLOW);
 				ota_reset();
+				return;
+			}
+			pb8[page_off++] = msg->Data[2 + i];
+			if( page_off >= PAGE_BYTES ) {
+				if( !ota_flush_page(PAGE_WORDS) ) {
+					ota_ack(op, OTA_ERR_FLASH);
+					ota_reset();
+					return;
+				}
 			}
 		}
 		return;
@@ -388,6 +421,7 @@ void process_ota_msg(CanRxMsg* msg)
 		CRC_ResetDR();
 		CRC_CalcBlockCRC((uint32_t*)APP_BASE, (uint32_t)total_pages * PAGE_WORDS);
 		if( CRC_GetCRC() != crc ) {
+			GPIO_SetBits(GPIOB, GPIO_Pin_9);  // debug: latch on CRC mismatch
 			ota_ack(op, OTA_ERR_CRC);
 			ota_reset();
 			return;
@@ -413,12 +447,34 @@ void process_ota_msg(CanRxMsg* msg)
 	}
 }
 
+static void SystemClock_Config(void)
+{
+	RCC_DeInit();
+	RCC_HSEConfig(RCC_HSE_ON);
+	while (!RCC_WaitForHSEStartUp());
+
+	FLASH_SetLatency(FLASH_Latency_2);
+	RCC_HCLKConfig(RCC_SYSCLK_Div1);
+	RCC_PCLK1Config(RCC_HCLK_Div2);   // APB1 = 36 MHz
+	RCC_PCLK2Config(RCC_HCLK_Div1);
+
+	RCC_PLLConfig(RCC_PLLSource_HSE_Div1, RCC_PLLMul_9);
+	RCC_PLLCmd(ENABLE);
+	while (!RCC_GetFlagStatus(RCC_FLAG_PLLRDY));
+
+	RCC_SYSCLKConfig(RCC_SYSCLKSource_PLLCLK);
+	while (RCC_GetSYSCLKSource() != 0x08);
+
+	SystemCoreClock = 72000000;
+}
+
 //-----------------------------------------------------------------------------
 //  MAIN function
 //-----------------------------------------------------------------------------
 
 int main(void)
 {
+	SystemClock_Config();
 	if( SysTick_Config(SystemCoreClock / 1000) ) { // setup SysTick Timer for 1 msec interrupts
 		while( 1 );                                  // capture error
 	}
@@ -433,6 +489,7 @@ int main(void)
 
 	#ifdef LED_PIN
 	DDR(LED_PORT, LED_PIN, GPIO_Mode_Out_PP);
+	DDR(LED_PORT, GPIO_Pin_9, GPIO_Mode_Out_PP);
 	#endif
 
 	// do we have a node address left behind by the application?
@@ -440,7 +497,7 @@ int main(void)
 	have_addr = ((nv >> 8) == NODEADDR_MAGIC);
 	my_addr = have_addr ? (uint8_t)nv : 0;
 
-	can_init(CAN_BR_100);
+	can_init(CAN_BR_125);
 
 	// filter 0: OTA_DATA sent to broadcast (0xFF) or broadcast-except-self
 	// (0xFE) - these two addresses differ only in their LSB, so one
