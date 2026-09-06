@@ -4,11 +4,19 @@ PROJECT=MRMBootloader
 # libs dir
 LIBDIR=lib
 
-# build output dir - everything generated goes here
-BUILDDIR=build
+# build output dir - everything generated goes here. Keyed by PRODUCT_TYPE
+# so switching products never silently links stale objects built with a
+# different PRODUCT_TYPE baked in.
+BUILDDIR=build/product_$(PRODUCT_TYPE)
+
+# Product type identifier for this build. Must match the product_type byte
+# a sender puts in OTA_OP_INFO, or this device will reject the update -
+# keeps product A from accepting product B's firmware on a shared bus.
+# Override per product, e.g.: make PRODUCT_TYPE=2
+PRODUCT_TYPE=1
 
 # STM32 stdperiph lib defines
-CDEFS=-DHSE_VALUE=8000000 -DSTM32F10X_MD -DUSE_STDPERIPH_DRIVER
+CDEFS=-DHSE_VALUE=8000000 -DSTM32F10X_MD -DUSE_STDPERIPH_DRIVER -DPRODUCT_TYPE=$(PRODUCT_TYPE)
 
 #  List of the source files to be compiled/assembled (paths, not .o names)
 SOURCES=main.c can.c bl_startup_stm32f10x_md.s
@@ -81,6 +89,9 @@ stats: $(BUILDDIR)/$(PROJECT).elf
 
 clean:
 	$(REMOVE_DIR) $(BUILDDIR)
+
+distclean:
+	$(REMOVE_DIR) build
 
 program: $(BUILDDIR)/$(PROJECT).bin
 	st-flash write $< 0x08000000

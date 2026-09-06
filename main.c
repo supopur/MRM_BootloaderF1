@@ -17,13 +17,22 @@ blcan
 	handles by writing MAGIC_ADDR/NODEADDR_ADDR and resetting.
 
 	OTA_DATA payload, Data[0] = sub-opcode:
-	  OTA_OP_INFO  [op][page_count]              - announce an update, reset state
-	  OTA_OP_DATA  [op][up to 7 raw fw bytes]     - firmware bytes, in order
-	  OTA_OP_END   [op][crc32 LE]                 - finalize + verify whole image
-	  OTA_OP_ABORT [op]                           - cancel in-flight update
+	  OTA_OP_INFO  [op][product_type][page_count]  - announce an update, reset state
+	  OTA_OP_DATA  [op][up to 7 raw fw bytes]       - firmware bytes, in order
+	  OTA_OP_END   [op][crc32 LE]                   - finalize + verify whole image
+	  OTA_OP_ABORT [op]                             - cancel in-flight update
 
-	Every op gets a 3-byte broadcast SLAVE_OUT reply: [our_addr][op][err_code].
-	err_code 0 = OK, see OTA_ERR_* below.
+	product_type must match this build's PRODUCT_TYPE (set at compile time,
+	one value per product line) or the update is rejected outright - this is
+	what stops product A from flashing product B's firmware when an update is
+	broadcast to the whole bus. INFO always gets an ACK/NACK so the master
+	knows who is and isn't participating. DATA/END/ABORT get a reply only
+	from devices that are actively participating in the update (i.e. already
+	accepted a matching INFO) - a device sitting out someone else's update
+	stays completely silent instead of NACKing every frame.
+
+	Every reply (when sent) is a 3-byte broadcast SLAVE_OUT frame:
+	[our_addr][op][err_code]. err_code 0 = OK, see OTA_ERR_* below.
 
 	A page auto-flushes (erase+program) to flash the instant PAGE_BYTES worth
 	of data has been received - no separate "commit page" step. On OTA_OP_END,
@@ -82,20 +91,28 @@ static uint32_t* const NODEADDR_ADDR = (uint32_t*)(SRAM_BASE + 0x1004);
 static const uint32_t* APP_BASE = (uint32_t*)(0x08002000);
 static const uint16_t PAGE_COUNT = 64 - 8;
 
+// which product line this build is for - must match the product_type byte
+// in OTA_OP_INFO or the update is rejected. Override in the makefile per
+// product, e.g. -DPRODUCT_TYPE=2.
+#ifndef PRODUCT_TYPE
+#define PRODUCT_TYPE 0
+#endif
+
 // OTA_DATA sub-opcodes (payload[0])
-#define OTA_OP_INFO 0x00
-#define OTA_OP_DATA 0x01
-#define OTA_OP_END 0x02
+#define OTA_OP_INFO  0x00
+#define OTA_OP_DATA  0x01
+#define OTA_OP_END   0x02
 #define OTA_OP_ABORT 0x03
 
 // OTA ack error codes (payload[2] of the SLAVE_OUT reply)
-#define OTA_ERR_OK 0
-#define OTA_ERR_STATE 1 // op received in the wrong state (e.g. no INFO yet)
-#define OTA_ERR_SIZE 2 // page_count is 0 or too big for this device
-#define OTA_ERR_OVERFLOW 3 // more DATA received than page_count allows
-#define OTA_ERR_INCOMPLETE 4 // END received before all pages were received
-#define OTA_ERR_CRC 5 // final image CRC does not match
-#define OTA_ERR_FLASH 6 // erase/program/verify failed
+#define OTA_ERR_OK         0
+#define OTA_ERR_STATE      1 // reserved (non-participants now stay silent instead)
+#define OTA_ERR_PRODUCT    2 // product_type in INFO doesn't match this device
+#define OTA_ERR_SIZE       3 // page_count is 0 or too big for this device
+#define OTA_ERR_OVERFLOW   4 // more DATA received than page_count allows
+#define OTA_ERR_INCOMPLETE 5 // END received before all pages were received
+#define OTA_ERR_CRC        6 // final image CRC does not match
+#define OTA_ERR_FLASH      7 // erase/program/verify failed
 
 static const uint32_t NOCANRX_TO = 5;
 
@@ -113,10 +130,10 @@ static uint8_t my_addr;
 static uint8_t have_addr;
 
 static uint32_t pagebuf[PAGE_WORDS];
-static uint16_t page_off; // bytes filled in pagebuf so far
-static uint8_t cur_page; // next page index to write
-static uint8_t total_pages; // expected page count for this update (from INFO)
-static uint8_t ota_active; // set once a valid INFO has been received
+static uint16_t page_off;    // bytes filled in pagebuf so far
+static uint8_t cur_page;     // next page index to write
+static uint8_t total_pages;  // expected page count for this update (from INFO)
+static uint8_t ota_active;   // set once a valid INFO has been received
 
 //-----------------------------------------------------------------------------
 //  newlib required functions
@@ -302,9 +319,14 @@ void process_ota_msg(CanRxMsg* msg)
 	uint8_t op = msg->Data[0];
 
 	if( op == OTA_OP_INFO ) {
-		if( msg->DLC < 2 ) return;
-		uint8_t pc = msg->Data[1];
+		if( msg->DLC < 3 ) return;
+		uint8_t prod = msg->Data[1];
+		uint8_t pc = msg->Data[2];
 		ota_reset();
+		if( prod != PRODUCT_TYPE ) {
+			ota_ack(op, OTA_ERR_PRODUCT);
+			return;
+		}
 		if( (pc == 0) || (pc > PAGE_COUNT) ) {
 			ota_ack(op, OTA_ERR_SIZE);
 			return;
@@ -317,8 +339,12 @@ void process_ota_msg(CanRxMsg* msg)
 	}
 
 	if( op == OTA_OP_DATA ) {
-		if( !ota_active ) { ota_ack(op, OTA_ERR_STATE); return; }
-		if( cur_page >= total_pages ) { ota_ack(op, OTA_ERR_OVERFLOW); return; }
+		if( !ota_active ) return; // not participating in this update - stay silent
+		if( cur_page >= total_pages ) {
+			ota_ack(op, OTA_ERR_OVERFLOW);
+			ota_reset();
+			return;
+		}
 
 		uint8_t n = msg->DLC - 1;
 		uint8_t* pb8 = (uint8_t*)pagebuf;
@@ -339,7 +365,7 @@ void process_ota_msg(CanRxMsg* msg)
 
 	if( op == OTA_OP_END ) {
 		if( msg->DLC < 5 ) return;
-		if( !ota_active ) { ota_ack(op, OTA_ERR_STATE); return; }
+		if( !ota_active ) return; // not participating in this update - stay silent
 
 		if( page_off > 0 ) {
 			uint16_t nwords = (page_off + 3) / 4;
@@ -380,6 +406,7 @@ void process_ota_msg(CanRxMsg* msg)
 	}
 
 	if( op == OTA_OP_ABORT ) {
+		if( !ota_active ) return; // nothing to abort, stay silent
 		ota_reset();
 		ota_ack(op, OTA_ERR_OK);
 		return;
