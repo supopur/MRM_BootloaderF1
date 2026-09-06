@@ -40,7 +40,8 @@ DEBUG = dwarf-2
 GCFLAGS = -g$(DEBUG)
 GCFLAGS += $(CDEFS)
 GCFLAGS += -O$(OPTIMIZATION)
-GCFLAGS += -Wall -std=gnu99 -fno-common -mcpu=cortex-m3 -mthumb -ffunction-sections
+GCFLAGS += -Wall -std=gnu99 -fno-common -mcpu=cortex-m3 -mthumb -ffunction-sections -fdata-sections
+GCFLAGS += -fno-unwind-tables -fno-asynchronous-unwind-tables
 GCFLAGS += -I$(LIBDIR)/stm32f10x/inc -I$(LIBDIR)/cmsis
 #GCFLAGS += -Wcast-align -Wcast-qual -Wimplicit -Wpointer-arith -Wswitch
 #GCFLAGS += -Wredundant-decls -Wreturn-type -Wshadow -Wunused

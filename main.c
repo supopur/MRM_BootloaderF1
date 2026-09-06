@@ -4,10 +4,40 @@ blcan
 @file		main.c
 @author		Matej Kogovsek (matej@hamradio.si)
 @copyright	LGPL 2.1
+
+@note CAN protocol
+	Standard ID = [10:3] target node address | [2:0] message type
+	(see can.h: CAN_MK_ID / CAN_ID_TARGET / CAN_ID_MSGTYPE).
+
+	This bootloader only ever looks at CAN_MSGTYPE_OTA_DATA (0x00), addressed
+	either to CAN_ADDR_BROADCAST(_NOSELF) or to our own node address, if we
+	have one. Everything else (DHCP, MASTER_OUT, SLAVE_OUT, TIME_SYNC) is
+	filtered out in hardware and never reaches this code - that includes the
+	"reboot into bootloader" MASTER_OUT command, which the *application*
+	handles by writing MAGIC_ADDR/NODEADDR_ADDR and resetting.
+
+	OTA_DATA payload, Data[0] = sub-opcode:
+	  OTA_OP_INFO  [op][page_count]              - announce an update, reset state
+	  OTA_OP_DATA  [op][up to 7 raw fw bytes]     - firmware bytes, in order
+	  OTA_OP_END   [op][crc32 LE]                 - finalize + verify whole image
+	  OTA_OP_ABORT [op]                           - cancel in-flight update
+
+	Every op gets a 3-byte broadcast SLAVE_OUT reply: [our_addr][op][err_code].
+	err_code 0 = OK, see OTA_ERR_* below.
+
+	A page auto-flushes (erase+program) to flash the instant PAGE_BYTES worth
+	of data has been received - no separate "commit page" step. On OTA_OP_END,
+	any partial final page is padded with 0xFF (the erased-flash value) before
+	the whole-image CRC check, so a sender computing the expected CRC for a
+	non-page-aligned image must pad the same way.
+
+	Once OTA_OP_END verifies OK, the {page_count, crc} info page is written
+	and the existing "reboot into app once the bus goes quiet" logic in
+	main()'s loop (unchanged) takes over - no immediate reset is forced here.
 */
 
 #include "stm32f10x.h"
-
+#include "core_cm3.h"
 #include "can.h"
 
 #include <string.h>
@@ -23,7 +53,8 @@ blcan
 #define TMR_ID_LED 1
 #define TMR_ID_NUM 2
 
-#define PAGE_SIZE 0x100
+#define PAGE_WORDS 0x100              // words per flash page (STM32F1 page = 1KB)
+#define PAGE_BYTES (PAGE_WORDS * 4)
 
 //-----------------------------------------------------------------------------
 //  Typedefs
@@ -35,38 +66,36 @@ struct bl_pvars_t // size has to be a multiple of 4
 	uint32_t app_crc;
 };
 
-struct bl_cmd_t
-{
-	uint8_t brd;
-	uint8_t cmd;
-	uint16_t par1;
-	uint32_t par2;
-};
-
-void bl_cmd_t_size_check(void)
-{
-	// if sizeof(bl_cmd_t) != 8, the compiler will throw a duplicate case value error
-	switch(0) {case 0:case sizeof(struct bl_cmd_t) == 8:;}
-}
-
 //-----------------------------------------------------------------------------
 // Constants
 //-----------------------------------------------------------------------------
 
-static const uint16_t CANID_BOOTLOADER_CMD = 0xB0;
-static const uint16_t CANID_BOOTLOADER_RPLY = 0xB1;
-
-static const uint8_t BL_BOARD_ID = 1;
-
 static const uint32_t MAGIC_VAL = (uint32_t)(0x36051bf3);
 static uint32_t* const MAGIC_ADDR = (uint32_t*)(SRAM_BASE + 0x1000);
+
+// node address, written by the application before it reboots into this
+// bootloader. Valid only if the top 24 bits equal NODEADDR_MAGIC; if not
+// present/valid we simply only answer to broadcast traffic.
+#define NODEADDR_MAGIC 0x00C0FFEEUL
+static uint32_t* const NODEADDR_ADDR = (uint32_t*)(SRAM_BASE + 0x1004);
 
 static const uint32_t* APP_BASE = (uint32_t*)(0x08002000);
 static const uint16_t PAGE_COUNT = 64 - 8;
 
-static const uint8_t BL_CMD_WRITE_BUF = 1;
-static const uint8_t BL_CMD_WRITE_PAGE = 2;
-static const uint8_t BL_CMD_WRITE_CRC = 3;
+// OTA_DATA sub-opcodes (payload[0])
+#define OTA_OP_INFO 0x00
+#define OTA_OP_DATA 0x01
+#define OTA_OP_END 0x02
+#define OTA_OP_ABORT 0x03
+
+// OTA ack error codes (payload[2] of the SLAVE_OUT reply)
+#define OTA_ERR_OK 0
+#define OTA_ERR_STATE 1 // op received in the wrong state (e.g. no INFO yet)
+#define OTA_ERR_SIZE 2 // page_count is 0 or too big for this device
+#define OTA_ERR_OVERFLOW 3 // more DATA received than page_count allows
+#define OTA_ERR_INCOMPLETE 4 // END received before all pages were received
+#define OTA_ERR_CRC 5 // final image CRC does not match
+#define OTA_ERR_FLASH 6 // erase/program/verify failed
 
 static const uint32_t NOCANRX_TO = 5;
 
@@ -80,6 +109,15 @@ static volatile uint32_t lastcanrx;
 static volatile uint32_t tmr_cnt[TMR_ID_NUM];
 static uint32_t tmr_top[TMR_ID_NUM];
 
+static uint8_t my_addr;
+static uint8_t have_addr;
+
+static uint32_t pagebuf[PAGE_WORDS];
+static uint16_t page_off; // bytes filled in pagebuf so far
+static uint8_t cur_page; // next page index to write
+static uint8_t total_pages; // expected page count for this update (from INFO)
+static uint8_t ota_active; // set once a valid INFO has been received
+
 //-----------------------------------------------------------------------------
 //  newlib required functions
 //-----------------------------------------------------------------------------
@@ -88,8 +126,6 @@ void _exit(int status)
 {
 	while( 1 );
 }
-
-//int __errno; // required by math
 
 //-----------------------------------------------------------------------------
 //  Timers
@@ -209,19 +245,6 @@ void DDR(GPIO_TypeDef* port, uint16_t pin, GPIOMode_TypeDef mode)
 	GPIO_Init(port, &iotd);
 }
 
-void bl_tx_resp(uint8_t cmd, uint8_t ec)
-{
-	CanTxMsg m;
-	m.IDE = CAN_Id_Standard;
-	m.StdId = CANID_BOOTLOADER_RPLY;
-	m.RTR = CAN_RTR_Data;
-	m.DLC = 3;
-	m.Data[0] = BL_BOARD_ID;
-	m.Data[1] = cmd;
-	m.Data[2] = ec;
-	can_tx(&m);
-}
-
 void PreSystemInit(void)
 {
 	if( *(MAGIC_ADDR) == MAGIC_VAL ) {
@@ -234,75 +257,132 @@ void PreSystemInit(void)
 }
 
 //-----------------------------------------------------------------------------
-//  CAN msg processing
+//  OTA update handling
 //-----------------------------------------------------------------------------
 
-void process_can_msg(CanRxMsg* msg)
+static void ota_ack(uint8_t op, uint8_t err)
 {
-	static uint32_t pagebuf[PAGE_SIZE];
+	CanTxMsg m;
+	m.StdId = CAN_MK_ID(CAN_ADDR_BROADCAST, CAN_MSGTYPE_SLAVE_OUT);
+	m.IDE = CAN_Id_Standard;
+	m.RTR = CAN_RTR_Data;
+	m.DLC = 3;
+	m.Data[0] = have_addr ? my_addr : CAN_ADDR_BROADCAST;
+	m.Data[1] = op;
+	m.Data[2] = err;
+	can_tx(&m);
+}
 
-	if( (msg->StdId == CANID_BOOTLOADER_CMD) && (msg->DLC == 8) ) {
-		struct bl_cmd_t blc;
-		memcpy(&blc, msg->Data, 8);
-		if( blc.brd != BL_BOARD_ID ) return;
-		lastcanrx = uptime;
+static void ota_reset(void)
+{
+	ota_active = 0;
+	page_off = 0;
+	cur_page = 0;
+	total_pages = 0;
+}
 
-		// write buffer command, par1 = offset, par2 =data
-		if( blc.cmd == BL_CMD_WRITE_BUF ) {
-			if( blc.par1 < PAGE_SIZE ) {
-				pagebuf[blc.par1] = blc.par2;
-				bl_tx_resp(blc.cmd, 0); // OK
-			} else {
-				bl_tx_resp(blc.cmd, 1); // invalid ofs
+// erases+programs flash page cur_page from pagebuf (nwords words), advances
+// cur_page and re-primes pagebuf with the erased-flash fill value on success.
+static uint8_t ota_flush_page(uint16_t nwords)
+{
+	if( fls_wr(APP_BASE + (uint32_t)cur_page * PAGE_WORDS, pagebuf, nwords) ) {
+		return 0;
+	}
+	++cur_page;
+	page_off = 0;
+	memset(pagebuf, 0xFF, sizeof(pagebuf));
+	return 1;
+}
+
+void process_ota_msg(CanRxMsg* msg)
+{
+	if( msg->DLC < 1 ) return;
+	lastcanrx = uptime;
+
+	uint8_t op = msg->Data[0];
+
+	if( op == OTA_OP_INFO ) {
+		if( msg->DLC < 2 ) return;
+		uint8_t pc = msg->Data[1];
+		ota_reset();
+		if( (pc == 0) || (pc > PAGE_COUNT) ) {
+			ota_ack(op, OTA_ERR_SIZE);
+			return;
+		}
+		total_pages = pc;
+		ota_active = 1;
+		memset(pagebuf, 0xFF, sizeof(pagebuf));
+		ota_ack(op, OTA_ERR_OK);
+		return;
+	}
+
+	if( op == OTA_OP_DATA ) {
+		if( !ota_active ) { ota_ack(op, OTA_ERR_STATE); return; }
+		if( cur_page >= total_pages ) { ota_ack(op, OTA_ERR_OVERFLOW); return; }
+
+		uint8_t n = msg->DLC - 1;
+		uint8_t* pb8 = (uint8_t*)pagebuf;
+		uint8_t i;
+		for( i = 0; i < n; ++i ) {
+			if( page_off >= PAGE_BYTES ) break; // ignore stray extra bytes
+			pb8[page_off++] = msg->Data[1 + i];
+		}
+
+		if( page_off >= PAGE_BYTES ) {
+			if( !ota_flush_page(PAGE_WORDS) ) {
+				ota_ack(op, OTA_ERR_FLASH);
+				ota_reset();
 			}
+		}
+		return;
+	}
+
+	if( op == OTA_OP_END ) {
+		if( msg->DLC < 5 ) return;
+		if( !ota_active ) { ota_ack(op, OTA_ERR_STATE); return; }
+
+		if( page_off > 0 ) {
+			uint16_t nwords = (page_off + 3) / 4;
+			if( !ota_flush_page(nwords) ) {
+				ota_ack(op, OTA_ERR_FLASH);
+				ota_reset();
+				return;
+			}
+		}
+
+		if( cur_page != total_pages ) {
+			ota_ack(op, OTA_ERR_INCOMPLETE);
+			ota_reset();
 			return;
 		}
 
-		// write page command, par1 = page number, par2 = crc
-		if( blc.cmd == BL_CMD_WRITE_PAGE ) {
-			if( blc.par1 < PAGE_COUNT) {
-				CRC_ResetDR();
-				CRC_CalcBlockCRC(pagebuf, PAGE_SIZE);
-				if( CRC_GetCRC() == blc.par2 ) {
-					uint32_t pgofs = blc.par1 * PAGE_SIZE;
-					uint8_t r = fls_wr(APP_BASE + pgofs, pagebuf, PAGE_SIZE);
-					if( r ) {
-						bl_tx_resp(blc.cmd, 3); // verify failed
-				  } else {
-						bl_tx_resp(blc.cmd, 0); // OK
-					}
-				} else {
-					bl_tx_resp(blc.cmd, 2); // invalid CRC
-				}
-			} else {
-				bl_tx_resp(blc.cmd, 1); // invalid pagenum
-			}
+		uint32_t crc;
+		memcpy(&crc, msg->Data + 1, 4); // little-endian, matches Cortex-M3
+
+		CRC_ResetDR();
+		CRC_CalcBlockCRC((uint32_t*)APP_BASE, (uint32_t)total_pages * PAGE_WORDS);
+		if( CRC_GetCRC() != crc ) {
+			ota_ack(op, OTA_ERR_CRC);
+			ota_reset();
 			return;
 		}
 
-		// write CRC command, par1 = number of pages, par2 = crc
-		if( blc.cmd == BL_CMD_WRITE_CRC ) {
-			if( blc.par1 <= PAGE_COUNT ) {
-				CRC_ResetDR();
-				CRC_CalcBlockCRC((uint32_t*)APP_BASE, blc.par1 * PAGE_SIZE);
-				if( CRC_GetCRC() == blc.par2 ) {
-					struct bl_pvars_t pv;
-					pv.app_page_count = blc.par1;
-					pv.app_crc = blc.par2;
-					uint8_t r = fls_wr(APP_BASE - PAGE_SIZE, (uint32_t*)&pv, sizeof(pv)/4);
-					if( r ) {
-						bl_tx_resp(blc.cmd, 3); // verify failed
-				  } else {
-						bl_tx_resp(blc.cmd, 0); // OK
-					}
-				} else {
-					bl_tx_resp(blc.cmd, 2); // invalid CRC
-				}
-			} else {
-				bl_tx_resp(blc.cmd, 1); // invalid number of pages
-			}
-			return;
+		struct bl_pvars_t pv;
+		pv.app_page_count = total_pages;
+		pv.app_crc = crc;
+		if( fls_wr(APP_BASE - PAGE_WORDS, (uint32_t*)&pv, sizeof(pv) / 4) ) {
+			ota_ack(op, OTA_ERR_FLASH);
+		} else {
+			ota_ack(op, OTA_ERR_OK); // app boots once the bus goes quiet
 		}
+		ota_reset();
+		return;
+	}
+
+	if( op == OTA_OP_ABORT ) {
+		ota_reset();
+		ota_ack(op, OTA_ERR_OK);
+		return;
 	}
 }
 
@@ -328,8 +408,22 @@ int main(void)
 	DDR(LED_PORT, LED_PIN, GPIO_Mode_Out_PP);
 	#endif
 
+	// do we have a node address left behind by the application?
+	uint32_t nv = *NODEADDR_ADDR;
+	have_addr = ((nv >> 8) == NODEADDR_MAGIC);
+	my_addr = have_addr ? (uint8_t)nv : 0;
+
 	can_init(CAN_BR_100);
-	can_filter((uint32_t)CANID_BOOTLOADER_CMD << 21, (uint32_t)0x7ff << 21, 0);
+
+	// filter 0: OTA_DATA sent to broadcast (0xFF) or broadcast-except-self
+	// (0xFE) - these two addresses differ only in their LSB, so one
+	// mask-based filter catches both.
+	can_filter(CAN_MK_ID(CAN_ADDR_BROADCAST_NOSELF, CAN_MSGTYPE_OTA_DATA), 0x7F7, 0);
+
+	// filter 1: OTA_DATA sent to our own address, if we have one
+	if( have_addr ) {
+		can_filter(CAN_MK_ID(my_addr, CAN_MSGTYPE_OTA_DATA), 0x7FF, 1);
+	}
 
 	tmr_set(TMR_ID_LED, 100);
 
@@ -349,17 +443,17 @@ int main(void)
 		// Process CAN messages
 		CanRxMsg msg;
 		if( can_rx(&msg) ) {
-			process_can_msg(&msg);
+			process_ota_msg(&msg);
 		}
 
-		// reset if no CAN messages received
+		// reset if no relevant CAN messages received
 		if( uptime - lastcanrx > NOCANRX_TO ) {
 			struct bl_pvars_t pv;
-			memcpy(&pv, APP_BASE - PAGE_SIZE, sizeof(pv));
+			memcpy(&pv, APP_BASE - PAGE_WORDS, sizeof(pv));
 
 			if( (pv.app_page_count > 0) && (pv.app_page_count <= PAGE_COUNT) ) {
 				CRC_ResetDR();
-				CRC_CalcBlockCRC((uint32_t*)APP_BASE, pv.app_page_count * PAGE_SIZE);
+				CRC_CalcBlockCRC((uint32_t*)APP_BASE, pv.app_page_count * PAGE_WORDS);
 				if( CRC_GetCRC() == pv.app_crc ) {
 					*(MAGIC_ADDR) = MAGIC_VAL;
 				}

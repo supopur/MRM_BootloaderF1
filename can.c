@@ -54,15 +54,20 @@ uint8_t can_filter(uint32_t id, uint32_t msk, uint8_t canfilnum)
 {
 	if( canfilnum >= 14 ) return 0;
 
-	// CAN1 filter init
+	// standard ID lives in bits [31:21] of the 32-bit filter register value;
+	// bit 2 is IDE, force it to 0/match so extended-ID frames never slip
+	// through a standard-ID filter.
+	uint32_t idr = id << 21;
+	uint32_t mskr = (msk << 21) | (1UL << 2);
+
 	CAN_FilterInitTypeDef fitd;
 	fitd.CAN_FilterNumber = canfilnum;
 	fitd.CAN_FilterMode = CAN_FilterMode_IdMask;
 	fitd.CAN_FilterScale = CAN_FilterScale_32bit;
-	fitd.CAN_FilterIdHigh = id >> 16;
-	fitd.CAN_FilterIdLow = 0;
-	fitd.CAN_FilterMaskIdHigh = msk >> 16;
-	fitd.CAN_FilterMaskIdLow = 0;
+	fitd.CAN_FilterIdHigh = idr >> 16;
+	fitd.CAN_FilterIdLow = (uint16_t)idr;
+	fitd.CAN_FilterMaskIdHigh = mskr >> 16;
+	fitd.CAN_FilterMaskIdLow = (uint16_t)mskr;
 	fitd.CAN_FilterFIFOAssignment = CAN_Filter_FIFO0;
 	fitd.CAN_FilterActivation = ENABLE;
 	CAN_FilterInit(&fitd);
