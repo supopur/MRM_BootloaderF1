@@ -116,7 +116,7 @@ static const uint16_t PAGE_COUNT = 64 - 8;
 #define OTA_ERR_SEQ        8 // seq mismatch - resend from Data[3]
 
 //IN SECONDS!
-static const uint32_t NOCANRX_TO = 5;
+static const uint32_t NOCANRX_TO = 2;
 
 //-----------------------------------------------------------------------------
 //  Global variables
