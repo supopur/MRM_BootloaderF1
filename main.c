@@ -65,6 +65,8 @@ blcan
 #define PAGE_WORDS 0x100              // words per flash page (STM32F1 page = 1KB)
 #define PAGE_BYTES (PAGE_WORDS * 4)
 
+#define FLASH_SIZE_REG  (*(__IO uint16_t*)0x1FFFF7E0UL)
+
 //-----------------------------------------------------------------------------
 //  Typedefs
 //-----------------------------------------------------------------------------
@@ -89,7 +91,7 @@ static uint32_t* const MAGIC_ADDR = (uint32_t*)(SRAM_BASE + 0x1000);
 static uint32_t* const NODEADDR_ADDR = (uint32_t*)(SRAM_BASE + 0x1004);
 
 static const uint32_t* APP_BASE = (uint32_t*)(0x08002000);
-static const uint16_t PAGE_COUNT = 64 - 8;
+static uint16_t PAGE_COUNT;
 
 // which product line this build is for - must match the product_type byte
 // in OTA_OP_INFO or the update is rejected. Override in the makefile per
@@ -491,6 +493,8 @@ int main(void)
 	DDR(LED_PORT, LED_PIN, GPIO_Mode_Out_PP);
 	DDR(LED_PORT, GPIO_Pin_9, GPIO_Mode_Out_PP);
 	#endif
+
+	PAGE_COUNT = FLASH_SIZE_REG - 8;
 
 	// do we have a node address left behind by the application?
 	uint32_t nv = *NODEADDR_ADDR;
