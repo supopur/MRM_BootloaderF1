@@ -17,32 +17,58 @@ blcan
 	handles by writing MAGIC_ADDR/NODEADDR_ADDR and resetting.
 
 	OTA_DATA payload, Data[0] = sub-opcode:
-	  OTA_OP_INFO  [op][product_type][page_count]  - announce an update, reset state
-	  OTA_OP_DATA  [op][up to 7 raw fw bytes]       - firmware bytes, in order
-	  OTA_OP_END   [op][crc32 LE]                   - finalize + verify whole image
-	  OTA_OP_ABORT [op]                             - cancel in-flight update
+	  OTA_OP_INFO     [op][product_type][page_count]     - announce an update, reset state
+	  OTA_OP_DATA     [op][up to 7 raw fw bytes]          - firmware bytes, in order
+	  OTA_OP_PAGE_END [op][crc32 LE][page_index]          - commit + verify one page
+	  OTA_OP_END      [op][crc32 LE]                      - finalize + verify whole image
+	  OTA_OP_ABORT    [op]                                - cancel in-flight update
 
 	product_type must match this build's PRODUCT_TYPE (set at compile time,
 	one value per product line) or the update is rejected outright - this is
 	what stops product A from flashing product B's firmware when an update is
 	broadcast to the whole bus. INFO always gets an ACK/NACK so the master
-	knows who is and isn't participating. DATA/END/ABORT get a reply only
-	from devices that are actively participating in the update (i.e. already
-	accepted a matching INFO) - a device sitting out someone else's update
-	stays completely silent instead of NACKing every frame.
+	knows who is and isn't participating. DATA/PAGE_END/END/ABORT get a reply
+	only from devices that are actively participating in the update (i.e.
+	already accepted a matching INFO) - a device sitting out someone else's
+	update stays completely silent.
 
-	Every reply (when sent) is a 3-byte broadcast SLAVE_OUT frame:
+	Transfer is stop-and-wait, one page (PAGE_BYTES = 1024) at a time:
+	the sender blasts all of a page's OTA_OP_DATA frames back-to-back with
+	no per-frame reply (DATA is never ACKed or NACKed - keeps the bus free
+	of chatter and lets frames go out at full CAN rate), then sends a single
+	OTA_OP_PAGE_END carrying the CRC32 of that page (same STM32 hardware
+	CRC32 algorithm as OTA_OP_END, i.e. no input/output reflection, no final
+	XOR) and the 0-based index of the page it believes it just sent. Only
+	OTA_OP_PAGE_END and OTA_OP_END ever touch flash - DATA only fills a RAM
+	buffer - so a bad/incomplete page never gets written.
+
+	The reply to OTA_OP_PAGE_END is always a 4-byte broadcast SLAVE_OUT
+	frame: [our_addr][op][err_code][cur_page], where cur_page is *our*
+	authoritative "next page expected" counter. This lets the sender
+	recover from a lost ACK without corrupting the wrong page: if its
+	page_index doesn't match cur_page, we reply OTA_ERR_PAGE_INDEX instead
+	of touching anything, and the sender resyncs off cur_page (if we're
+	already one page ahead, our previous OK was simply lost on the wire and
+	the sender just moves on; otherwise it resends the page cur_page names).
+	If page_index matches but the buffer isn't full (OTA_ERR_PAGE_INCOMPLETE)
+	or its CRC doesn't match (OTA_ERR_PAGE_CRC), the whole page is discarded
+	and must be resent from scratch - no partial resend bookkeeping, which
+	is what made the old per-frame sequence-number scheme both slow (it
+	required a reply loop practically per frame) and buggy (its sequence
+	counter wrapped at 256 frames, silently corrupting any resend past the
+	first ~1.5KB of a page). Since every page sent over the wire is always
+	exactly PAGE_BYTES (the sender pads the final page of the image with
+	0xFF, the erased-flash value), OTA_OP_PAGE_END never has to deal with a
+	short final page.
+
+	Every other reply (INFO/END/ABORT) stays the old 3-byte format:
 	[our_addr][op][err_code]. err_code 0 = OK, see OTA_ERR_* below.
 
-	A page auto-flushes (erase+program) to flash the instant PAGE_BYTES worth
-	of data has been received - no separate "commit page" step. On OTA_OP_END,
-	any partial final page is padded with 0xFF (the erased-flash value) before
-	the whole-image CRC check, so a sender computing the expected CRC for a
-	non-page-aligned image must pad the same way.
-
-	Once OTA_OP_END verifies OK, the {page_count, crc} info page is written
-	and the existing "reboot into app once the bus goes quiet" logic in
-	main()'s loop (unchanged) takes over - no immediate reset is forced here.
+	On OTA_OP_END, the whole image (all total_pages pages, already verified
+	and flashed page-by-page) is CRC32'd again as a final end-to-end check
+	before the {page_count, crc} info page is written. That done, the
+	existing "reboot into app once the bus goes quiet" logic in main()'s
+	loop (unchanged) takes over - no immediate reset is forced here.
 */
 
 #include "stm32f10x.h"
@@ -101,21 +127,24 @@ static uint16_t PAGE_COUNT;
 #endif
 
 // OTA_DATA sub-opcodes (payload[0])
-#define OTA_OP_INFO  0x00
-#define OTA_OP_DATA  0x01
-#define OTA_OP_END   0x02
-#define OTA_OP_ABORT 0x03
+#define OTA_OP_INFO     0x00
+#define OTA_OP_DATA     0x01
+#define OTA_OP_END      0x02
+#define OTA_OP_ABORT    0x03
+#define OTA_OP_PAGE_END 0x04
 
 // OTA ack error codes (payload[2] of the SLAVE_OUT reply)
-#define OTA_ERR_OK         0
-#define OTA_ERR_STATE      1 // reserved (non-participants now stay silent instead)
-#define OTA_ERR_PRODUCT    2 // product_type in INFO doesn't match this device
-#define OTA_ERR_SIZE       3 // page_count is 0 or too big for this device
-#define OTA_ERR_OVERFLOW   4 // more DATA received than page_count allows
-#define OTA_ERR_INCOMPLETE 5 // END received before all pages were received
-#define OTA_ERR_CRC        6 // final image CRC does not match
-#define OTA_ERR_FLASH      7 // erase/program/verify failed
-#define OTA_ERR_SEQ        8 // seq mismatch - resend from Data[3]
+#define OTA_ERR_OK              0
+#define OTA_ERR_STATE           1 // reserved (non-participants now stay silent instead)
+#define OTA_ERR_PRODUCT         2 // product_type in INFO doesn't match this device
+#define OTA_ERR_SIZE            3 // page_count is 0 or too big for this device
+#define OTA_ERR_OVERFLOW        4 // more DATA received than page_count allows
+#define OTA_ERR_INCOMPLETE      5 // END received before all pages were received
+#define OTA_ERR_CRC              6 // final whole-image CRC does not match
+#define OTA_ERR_FLASH            7 // erase/program/verify failed
+#define OTA_ERR_PAGE_INCOMPLETE  8 // PAGE_END: buffer isn't full yet - resend this whole page
+#define OTA_ERR_PAGE_CRC         9 // PAGE_END: page CRC mismatch - resend this whole page
+#define OTA_ERR_PAGE_INDEX      10 // PAGE_END: page_index != our cur_page - resync off cur_page
 
 //IN SECONDS!
 static const uint32_t NOCANRX_TO = 2;
@@ -138,7 +167,6 @@ static uint16_t page_off;    // bytes filled in pagebuf so far
 static uint8_t cur_page;     // next page index to write
 static uint8_t total_pages;  // expected page count for this update (from INFO)
 static uint8_t ota_active;   // set once a valid INFO has been received
-static uint8_t expected_seq;
 
 //-----------------------------------------------------------------------------
 //  newlib required functions
@@ -282,7 +310,10 @@ void PreSystemInit(void)
 //  OTA update handling
 //-----------------------------------------------------------------------------
 
-static void ota_nack_seq(uint8_t op, uint8_t err, uint8_t want_seq)
+// Reply used for OTA_OP_PAGE_END only - always reports cur_page (our
+// authoritative "next page expected" counter) alongside the error code, so
+// the sender can resync after a lost reply instead of guessing.
+static void ota_ack_page(uint8_t op, uint8_t err, uint8_t page)
 {
 	CanTxMsg m;
 	m.StdId = CAN_MK_ID(CAN_ADDR_BROADCAST, CAN_MSGTYPE_SLAVE_OUT);
@@ -292,7 +323,7 @@ static void ota_nack_seq(uint8_t op, uint8_t err, uint8_t want_seq)
 	m.Data[0] = have_addr ? my_addr : CAN_ADDR_BROADCAST;
 	m.Data[1] = op;
 	m.Data[2] = err;
-	m.Data[3] = want_seq;
+	m.Data[3] = page;
 	can_tx(&m);
 }
 
@@ -315,7 +346,7 @@ static void ota_reset(void)
 	page_off = 0;
 	cur_page = 0;
 	total_pages = 0;
-	expected_seq = 0;
+	GPIO_ResetBits(GPIOB, GPIO_Pin_9);
 }
 
 // erases+programs flash page cur_page from pagebuf (nwords words), advances
@@ -359,57 +390,85 @@ void process_ota_msg(CanRxMsg* msg)
 	}
 
 	if( op == OTA_OP_DATA ) {
+		// DATA is never ACKed or NACKed - it only fills the RAM page
+		// buffer. Correctness (and any resend) is entirely handled by
+		// OTA_OP_PAGE_END below, so the sender can blast a whole page's
+		// worth of frames back-to-back at full CAN rate.
 		if( !ota_active ) return;
-		if( msg->DLC < 2 ) return;
-
-		uint8_t seq = msg->Data[1];
-		if( seq != expected_seq ) {
-			GPIO_SetBits(GPIOB, GPIO_Pin_9);
-			ota_nack_seq(op, OTA_ERR_SEQ, expected_seq); // tell sender what we actually need
-			return; // NOTE: no ota_reset() here - state is preserved, we just wait
-		}
-		GPIO_ResetBits(GPIOB, GPIO_Pin_9);
-		++expected_seq;
-
 		if( cur_page >= total_pages ) {
-			ota_ack(op, OTA_ERR_OVERFLOW); // this one's a real, unrecoverable error - reset stands
+			ota_ack(op, OTA_ERR_OVERFLOW); // sender bug - it kept going past total_pages
 			ota_reset();
 			return;
 		}
 
-		uint8_t n = msg->DLC - 2;
+		uint8_t n = msg->DLC - 1;
 		uint8_t* pb8 = (uint8_t*)pagebuf;
 		uint8_t i;
 		for( i = 0; i < n; ++i ) {
-			if( cur_page >= total_pages ) {
-				ota_ack(op, OTA_ERR_OVERFLOW);
-				ota_reset();
-				return;
-			}
-			pb8[page_off++] = msg->Data[2 + i];
 			if( page_off >= PAGE_BYTES ) {
-				if( !ota_flush_page(PAGE_WORDS) ) {
-					ota_ack(op, OTA_ERR_FLASH);
-					ota_reset();
-					return;
-				}
+				// Sender kept streaming past a full page without a
+				// PAGE_END. Drop the extra bytes rather than overrun
+				// pagebuf - PAGE_END will see a full-but-wrong-tail
+				// buffer, fail its CRC check, and force a clean resend.
+				break;
 			}
+			pb8[page_off++] = msg->Data[1 + i];
 		}
+		return;
+	}
+
+	if( op == OTA_OP_PAGE_END ) {
+		if( !ota_active ) return;
+		if( msg->DLC < 6 ) return;
+		if( cur_page >= total_pages ) return; // shouldn't happen with a sane sender, ignore
+
+		uint32_t page_crc;
+		memcpy(&page_crc, msg->Data + 1, 4); // little-endian, matches Cortex-M3
+		uint8_t sender_page = msg->Data[5];
+
+		if( sender_page != cur_page ) {
+			// Sender's view of progress doesn't match ours - almost
+			// always because our previous PAGE_END reply got lost on
+			// the bus. Report our real counter and touch nothing, so
+			// the sender can resync instead of us guessing and risking
+			// writing this page's data into the wrong slot.
+			ota_ack_page(op, OTA_ERR_PAGE_INDEX, cur_page);
+			return;
+		}
+
+		if( page_off != PAGE_BYTES ) {
+			GPIO_SetBits(GPIOB, GPIO_Pin_9);
+			ota_ack_page(op, OTA_ERR_PAGE_INCOMPLETE, cur_page);
+			page_off = 0; // discard - sender resends this whole page
+			memset(pagebuf, 0xFF, sizeof(pagebuf));
+			return;
+		}
+
+		CRC_ResetDR();
+		CRC_CalcBlockCRC(pagebuf, PAGE_WORDS);
+		if( CRC_GetCRC() != page_crc ) {
+			GPIO_SetBits(GPIOB, GPIO_Pin_9);
+			ota_ack_page(op, OTA_ERR_PAGE_CRC, cur_page);
+			page_off = 0; // discard - sender resends this whole page
+			memset(pagebuf, 0xFF, sizeof(pagebuf));
+			return;
+		}
+
+		GPIO_ResetBits(GPIOB, GPIO_Pin_9);
+
+		if( !ota_flush_page(PAGE_WORDS) ) { // erase+program; advances cur_page on success
+			ota_ack_page(op, OTA_ERR_FLASH, cur_page);
+			ota_reset(); // local flash hardware failure - whole update is dead
+			return;
+		}
+
+		ota_ack_page(op, OTA_ERR_OK, cur_page); // cur_page already advanced past the committed page
 		return;
 	}
 
 	if( op == OTA_OP_END ) {
 		if( msg->DLC < 5 ) return;
 		if( !ota_active ) return; // not participating in this update - stay silent
-
-		if( page_off > 0 ) {
-			uint16_t nwords = (page_off + 3) / 4;
-			if( !ota_flush_page(nwords) ) {
-				ota_ack(op, OTA_ERR_FLASH);
-				ota_reset();
-				return;
-			}
-		}
 
 		if( cur_page != total_pages ) {
 			ota_ack(op, OTA_ERR_INCOMPLETE);
