@@ -9,7 +9,14 @@
 #include <stm32f10x.h>
 #include <stm32f10x_can.h>
 
-void can_init(uint16_t br)
+//-----------------------------------------------------------------------------
+//  CAN filter mask helper – forces IDE=0 and RTR=data
+//-----------------------------------------------------------------------------
+#define CAN_FILTER_ID_SHIFT  21U
+#define CAN_FILTER_IDE_MASK  (1UL << 2)
+#define CAN_FILTER_RTR_MASK  (1UL << 1)
+
+uint8_t can_init(uint16_t br)
 {
 	GPIO_InitTypeDef iotd;
 
@@ -37,7 +44,7 @@ void can_init(uint16_t br)
 	CAN_InitTypeDef cnis;
 	CAN_StructInit(&cnis);
 	cnis.CAN_TTCM = DISABLE;
-	cnis.CAN_ABOM = DISABLE;
+	cnis.CAN_ABOM = ENABLE;      // automatic bus‑off recovery
 	cnis.CAN_AWUM = DISABLE;
 	cnis.CAN_NART = ENABLE;
 	cnis.CAN_RFLM = DISABLE;
@@ -47,18 +54,22 @@ void can_init(uint16_t br)
 	cnis.CAN_BS1 = CAN_BS1_3tq;
 	cnis.CAN_BS2 = CAN_BS2_2tq;
 	cnis.CAN_Prescaler = br;
-	CAN_Init(CAN1, &cnis);
+
+	// Return 0 if init succeeded, 1 otherwise
+	return (CAN_Init(CAN1, &cnis) == CAN_InitStatus_Success) ? 0 : 1;
 }
 
 uint8_t can_filter(uint32_t id, uint32_t msk, uint8_t canfilnum)
 {
 	if( canfilnum >= 14 ) return 0;
 
-	// standard ID lives in bits [31:21] of the 32-bit filter register value;
-	// bit 2 is IDE, force it to 0/match so extended-ID frames never slip
-	// through a standard-ID filter.
-	uint32_t idr = id << 21;
-	uint32_t mskr = (msk << 21) | (1UL << 2);
+	// Standard ID lives in bits [31:21] of the 32-bit filter register value.
+	// Force IDE bit to 0 and RTR bit to 0 (data frame) so extended and remote
+	// frames never match a standard‑ID filter.
+	uint32_t idr = id << CAN_FILTER_ID_SHIFT;
+	uint32_t mskr = (msk << CAN_FILTER_ID_SHIFT) |
+	                CAN_FILTER_IDE_MASK |
+	                CAN_FILTER_RTR_MASK;
 
 	CAN_FilterInitTypeDef fitd;
 	fitd.CAN_FilterNumber = canfilnum;
@@ -77,7 +88,14 @@ uint8_t can_filter(uint32_t id, uint32_t msk, uint8_t canfilnum)
 
 uint8_t can_tx(CanTxMsg* msg)
 {
-	return CAN_TxStatus_NoMailBox != CAN_Transmit(CAN1, msg);
+	uint8_t mailbox = CAN_Transmit(CAN1, msg);
+	if (mailbox == CAN_TxStatus_NoMailBox) return 0;
+	// Wait for transmission to complete or time out (simple implementation)
+	uint32_t timeout = 0xFFFF;
+	while (!(CAN_TransmitStatus(CAN1, mailbox) & CAN_TxStatus_Failed) && timeout--) {
+		if (CAN_TransmitStatus(CAN1, mailbox) & CAN_TxStatus_Ok) return 1;
+	}
+	return 0; // timed out or failed
 }
 
 uint8_t can_rx(CanRxMsg* msg)

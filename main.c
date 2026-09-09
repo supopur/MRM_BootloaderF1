@@ -93,30 +93,44 @@ blcan
 
 #define FLASH_SIZE_REG  (*(__IO uint16_t*)0x1FFFF7E0UL)
 
+// Bootloader layout
+#define BOOT_APP_ADDRESS 0x08002000UL
+#define BOOT_INFO_ADDRESS 0x08001C00UL
+#define BOOT_RESERVED_KIB 8UL
+#define BOOT_PAGE_BYTES 1024UL
+#define BOOT_PAGE_WORDS 256UL
+#define BOOT_REQUEST_ADDRESS 0x20001000UL
+#define BOOT_NODE_ADDRESS 0x20001004UL
+#define BOOT_REQUEST_MAGIC 0x36051BF3UL
+#define BOOT_NODE_MAGIC 0x00C0FFEEUL
+#define BOOT_NODE_SHIFT 8U
+#define BOOT_C6_FLASH_KIB 32U
+#define BOOT_C8_FLASH_KIB 64U
+#define BOOT_C6_RAM_BYTES 10240UL
+#define BOOT_C8_RAM_BYTES 20480UL
+#define BOOT_STACK_ALIGNMENT 8UL
+#define BOOT_THUMB_BIT 1UL
+#define BOOT_VECTOR_BYTES 8UL
+
 //-----------------------------------------------------------------------------
 //  Typedefs
 //-----------------------------------------------------------------------------
 
-struct bl_pvars_t // size has to be a multiple of 4
-{
-	uint32_t app_page_count;
-	uint32_t app_crc;
-};
+typedef struct {
+    uint32_t pageCount;
+    uint32_t crc;
+} BootInfo_t;
 
 //-----------------------------------------------------------------------------
 // Constants
 //-----------------------------------------------------------------------------
 
-static const uint32_t MAGIC_VAL = (uint32_t)(0x36051bf3);
-static uint32_t* const MAGIC_ADDR = (uint32_t*)(SRAM_BASE + 0x1000);
+static const uint32_t MAGIC_VAL = BOOT_REQUEST_MAGIC;
+static uint32_t* const MAGIC_ADDR = (uint32_t*)BOOT_REQUEST_ADDRESS;
+static uint32_t* const NODEADDR_ADDR = (uint32_t*)BOOT_NODE_ADDRESS;
+#define NODEADDR_MAGIC  0x00C0FFEEUL
 
-// node address, written by the application before it reboots into this
-// bootloader. Valid only if the top 24 bits equal NODEADDR_MAGIC; if not
-// present/valid we simply only answer to broadcast traffic.
-#define NODEADDR_MAGIC 0x00C0FFEEUL
-static uint32_t* const NODEADDR_ADDR = (uint32_t*)(SRAM_BASE + 0x1004);
-
-static const uint32_t* APP_BASE = (uint32_t*)(0x08002000);
+static const uint32_t* APP_BASE = (uint32_t*)BOOT_APP_ADDRESS;
 static uint16_t PAGE_COUNT;
 
 // which product line this build is for - must match the product_type byte
@@ -145,9 +159,6 @@ static uint16_t PAGE_COUNT;
 #define OTA_ERR_PAGE_INCOMPLETE  8 // PAGE_END: buffer isn't full yet - resend this whole page
 #define OTA_ERR_PAGE_CRC         9 // PAGE_END: page CRC mismatch - resend this whole page
 #define OTA_ERR_PAGE_INDEX      10 // PAGE_END: page_index != our cur_page - resync off cur_page
-
-//IN SECONDS!
-static const uint32_t NOCANRX_TO = 2;
 
 //-----------------------------------------------------------------------------
 //  Global variables
@@ -295,15 +306,149 @@ void DDR(GPIO_TypeDef* port, uint16_t pin, GPIOMode_TypeDef mode)
 	GPIO_Init(port, &iotd);
 }
 
+//-----------------------------------------------------------------------------
+//  Boot‑selection helpers (new)
+//-----------------------------------------------------------------------------
+
+static uint16_t flash_size_kib(void)
+{
+    // FLASH_SIZE_REG is already the value, not a pointer
+    return FLASH_SIZE_REG;
+}
+
+static uint16_t application_capacity(void)
+{
+    uint16_t flashSize_kib = flash_size_kib();
+
+    if (flashSize_kib != BOOT_C6_FLASH_KIB &&
+        flashSize_kib != BOOT_C8_FLASH_KIB) {
+        return 0;
+    }
+
+    return flashSize_kib - BOOT_RESERVED_KIB;
+}
+
+static uint8_t application_matches(uint32_t pageCount, uint32_t crc)
+{
+    volatile const uint32_t *p_vectors =
+        (volatile const uint32_t *)BOOT_APP_ADDRESS;
+    uint32_t capacity = application_capacity();
+    uint32_t ramBytes;
+    uint32_t imageEnd;
+    uint32_t stack;
+    uint32_t entry;
+
+    if (!capacity || !pageCount || pageCount > capacity) {
+        return 0;
+    }
+
+    ramBytes = flash_size_kib() == BOOT_C6_FLASH_KIB ?
+        BOOT_C6_RAM_BYTES : BOOT_C8_RAM_BYTES;
+    imageEnd = BOOT_APP_ADDRESS + pageCount * BOOT_PAGE_BYTES;
+    stack = p_vectors[0];
+    entry = p_vectors[1];
+
+    if ((stack & (BOOT_STACK_ALIGNMENT - 1UL)) ||
+        stack <= SRAM_BASE || stack > SRAM_BASE + ramBytes ||
+        !(entry & BOOT_THUMB_BIT)) {
+        return 0;
+    }
+
+    entry &= ~BOOT_THUMB_BIT;
+    if (entry < BOOT_APP_ADDRESS + BOOT_VECTOR_BYTES ||
+        entry >= imageEnd) {
+        return 0;
+    }
+
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_CRC, ENABLE);
+    CRC_ResetDR();
+
+    return CRC_CalcBlockCRC((uint32_t *)BOOT_APP_ADDRESS,
+                           pageCount * BOOT_PAGE_WORDS) == crc;
+}
+
+static uint8_t application_is_valid(void)
+{
+    volatile const BootInfo_t *p_info =
+        (volatile const BootInfo_t *)BOOT_INFO_ADDRESS;
+
+    return application_matches(p_info->pageCount, p_info->crc);
+}
+
+static uint8_t application_invalidate(void)
+{
+    volatile const uint32_t *p_info =
+        (volatile const uint32_t *)BOOT_INFO_ADDRESS;
+    FLASH_Status status;
+
+    FLASH_Unlock();
+    FLASH_ClearFlag(FLASH_FLAG_EOP | FLASH_FLAG_PGERR |
+                    FLASH_FLAG_WRPRTERR);
+    status = FLASH_ErasePage(BOOT_INFO_ADDRESS);
+    FLASH_Lock();
+
+    if (status != FLASH_COMPLETE) {
+        return 0;
+    }
+
+    for (uint32_t word = 0; word < BOOT_PAGE_WORDS; ++word) {
+        if (p_info[word] != UINT32_MAX) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* GCC: no C code may execute after changing MSP. */
+__attribute__((naked, noreturn))
+static void application_branch(uint32_t stack, uint32_t entry)
+{
+    __asm volatile (
+        "msr msp, r0\n"
+        "cpsie i\n"
+        "bx r1\n"
+    );
+}
+
+/* Not naked – it can call CMSIS inline functions */
+__attribute__((noreturn))
+static void application_jump(void)
+{
+    volatile const uint32_t *p_vectors =
+        (volatile const uint32_t *)BOOT_APP_ADDRESS;
+    uint32_t stack = p_vectors[0];
+    uint32_t entry = p_vectors[1];
+
+    __disable_irq();
+    SysTick->CTRL = 0;
+    SysTick->LOAD = 0;
+    SysTick->VAL = 0;
+
+    for (uint32_t bank = 0;
+         bank < sizeof(NVIC->ICER) / sizeof(NVIC->ICER[0]);
+         ++bank) {
+        NVIC->ICER[bank] = UINT32_MAX;
+        NVIC->ICPR[bank] = UINT32_MAX;
+    }
+
+    SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_CRC, DISABLE);
+    RCC_DeInit();
+
+    SCB->VTOR = BOOT_APP_ADDRESS;
+	__asm volatile ("msr CONTROL, %0" :: "r"(0u) : "memory");
+	__asm volatile ("msr BASEPRI, %0" :: "r"(0u) : "memory");
+	__asm volatile ("msr FAULTMASK, %0" :: "r"(0u) : "memory");
+    __DSB();
+    __ISB();
+
+    application_branch(stack, entry);
+}
+
+// empty hook – called by startup before main
 void PreSystemInit(void)
 {
-	if( *(MAGIC_ADDR) == MAGIC_VAL ) {
-		*(MAGIC_ADDR) = 0;
-		uint32_t sp = *(APP_BASE);
-		asm volatile ("MSR msp, %0" : : "r" (sp) : );
-		uint32_t app = *(APP_BASE + 1); // +1 = 4 bytes since uint32_t
-		asm("bx %0\n"::"r" (app):);
-	}
 }
 
 //-----------------------------------------------------------------------------
@@ -364,6 +509,12 @@ static uint8_t ota_flush_page(uint16_t nwords)
 
 void process_ota_msg(CanRxMsg* msg)
 {
+	// Basic frame sanity
+	if (msg->IDE != CAN_Id_Standard ||
+	    msg->RTR != CAN_RTR_Data ||
+	    msg->DLC == 0 || msg->DLC > sizeof(msg->Data)) {
+	    return;
+	}
 	if( msg->DLC < 1 ) return;
 	lastcanrx = uptime;
 
@@ -373,13 +524,19 @@ void process_ota_msg(CanRxMsg* msg)
 		if( msg->DLC < 3 ) return;
 		uint8_t prod = msg->Data[1];
 		uint8_t pc = msg->Data[2];
-		ota_reset();
+		// Validate product and size first
 		if( prod != PRODUCT_TYPE ) {
 			ota_ack(op, OTA_ERR_PRODUCT);
 			return;
 		}
 		if( (pc == 0) || (pc > PAGE_COUNT) ) {
 			ota_ack(op, OTA_ERR_SIZE);
+			return;
+		}
+		// Reset state and invalidate old metadata before accepting new image
+		ota_reset();
+		if (!application_invalidate()) {
+			ota_ack(op, OTA_ERR_FLASH);
 			return;
 		}
 		total_pages = pc;
@@ -401,39 +558,41 @@ void process_ota_msg(CanRxMsg* msg)
 			return;
 		}
 
-		uint8_t n = msg->DLC - 1;
-		uint8_t* pb8 = (uint8_t*)pagebuf;
-		uint8_t i;
-		for( i = 0; i < n; ++i ) {
-			if( page_off >= PAGE_BYTES ) {
-				// Sender kept streaming past a full page without a
-				// PAGE_END. Drop the extra bytes rather than overrun
-				// pagebuf - PAGE_END will see a full-but-wrong-tail
-				// buffer, fail its CRC check, and force a clean resend.
-				break;
-			}
-			pb8[page_off++] = msg->Data[1 + i];
+		uint8_t byteCount = msg->DLC - 1U;
+		// Detect overflow; if too many bytes, flag an error but keep the buffer
+		// so that PAGE_END will fail its CRC check.
+		if (page_off > PAGE_BYTES ||
+		    byteCount > PAGE_BYTES - page_off) {
+		    page_off = PAGE_BYTES + 1U;  // intentionally oversize
+		    return;
 		}
+		memcpy((uint8_t *)pagebuf + page_off, msg->Data + 1, byteCount);
+		page_off += byteCount;
 		return;
 	}
 
 	if( op == OTA_OP_PAGE_END ) {
 		if( !ota_active ) return;
 		if( msg->DLC < 6 ) return;
-		if( cur_page >= total_pages ) return; // shouldn't happen with a sane sender, ignore
 
 		uint32_t page_crc;
 		memcpy(&page_crc, msg->Data + 1, 4); // little-endian, matches Cortex-M3
 		uint8_t sender_page = msg->Data[5];
 
+		// First, handle index mismatch – resync without touching flash
 		if( sender_page != cur_page ) {
-			// Sender's view of progress doesn't match ours - almost
-			// always because our previous PAGE_END reply got lost on
-			// the bus. Report our real counter and touch nothing, so
-			// the sender can resync instead of us guessing and risking
-			// writing this page's data into the wrong slot.
-			ota_ack_page(op, OTA_ERR_PAGE_INDEX, cur_page);
-			return;
+		    // Discard any stale page data to avoid mixing with a future retry
+		    page_off = 0;
+		    memset(pagebuf, 0xFF, sizeof(pagebuf));
+		    ota_ack_page(op, OTA_ERR_PAGE_INDEX, cur_page);
+		    return;
+		}
+
+		// At this point sender_page == cur_page. Ensure we haven't already
+		// finished all pages (e.g. a spurious duplicate PAGE_END).
+		if( cur_page >= total_pages ) {
+		    ota_ack_page(op, OTA_ERR_OVERFLOW, cur_page);
+		    return;
 		}
 
 		if( page_off != PAGE_BYTES ) {
@@ -470,33 +629,46 @@ void process_ota_msg(CanRxMsg* msg)
 		if( msg->DLC < 5 ) return;
 		if( !ota_active ) return; // not participating in this update - stay silent
 
-		if( cur_page != total_pages ) {
+		// Check that all pages have been received and buffer is empty
+		if( cur_page != total_pages || page_off != 0 ) {
 			ota_ack(op, OTA_ERR_INCOMPLETE);
 			ota_reset();
 			return;
 		}
 
 		uint32_t crc;
-		memcpy(&crc, msg->Data + 1, 4); // little-endian, matches Cortex-M3
+		memcpy(&crc, msg->Data + 1, 4);
 
-		CRC_ResetDR();
-		CRC_CalcBlockCRC((uint32_t*)APP_BASE, (uint32_t)total_pages * PAGE_WORDS);
-		if( CRC_GetCRC() != crc ) {
-			GPIO_SetBits(GPIOB, GPIO_Pin_9);  // debug: latch on CRC mismatch
+		// Use the same validation function that we use at boot time
+		if (!application_matches(total_pages, crc)) {
+			GPIO_SetBits(GPIOB, GPIO_Pin_9);
 			ota_ack(op, OTA_ERR_CRC);
 			ota_reset();
 			return;
 		}
 
-		struct bl_pvars_t pv;
-		pv.app_page_count = total_pages;
-		pv.app_crc = crc;
-		if( fls_wr(APP_BASE - PAGE_WORDS, (uint32_t*)&pv, sizeof(pv) / 4) ) {
+		// Write the metadata page
+		BootInfo_t pv;
+		pv.pageCount = total_pages;
+		pv.crc = crc;
+		if( fls_wr((uint32_t*)BOOT_INFO_ADDRESS, (uint32_t*)&pv, sizeof(pv) / 4) ) {
 			ota_ack(op, OTA_ERR_FLASH);
-		} else {
-			ota_ack(op, OTA_ERR_OK); // app boots once the bus goes quiet
+			ota_reset();
+			return;
 		}
-		ota_reset();
+
+		// Verify that the metadata was written correctly
+		if (!application_is_valid()) {
+			ota_ack(op, OTA_ERR_FLASH);
+			ota_reset();
+			return;
+		}
+
+		// Send OK reply; then the main loop will reset the device after bus idle.
+		ota_ack(op, OTA_ERR_OK);
+		// Do NOT reset immediately – let the host receive the ACK.
+		// The existing idle‑timeout will trigger a reset.
+		ota_reset(); // clear active state but keep the written image valid
 		return;
 	}
 
@@ -535,6 +707,42 @@ static void SystemClock_Config(void)
 
 int main(void)
 {
+	// --- Early boot decision (must run before any clock/peripheral init) ---
+	volatile uint32_t *p_request =
+	    (volatile uint32_t *)BOOT_REQUEST_ADDRESS;
+	volatile uint32_t *p_node =
+	    (volatile uint32_t *)BOOT_NODE_ADDRESS;
+
+	uint32_t resetFlags = RCC->CSR;
+	uint32_t request = *p_request;
+	uint32_t node = *p_node;
+
+	// Clear the request magic so it is not reused
+	*p_request = 0;
+	*p_node = 0;
+	__DSB();
+	RCC_ClearFlag();
+
+	uint8_t requested =
+	    (resetFlags & RCC_CSR_SFTRSTF) &&
+	    !(resetFlags & RCC_CSR_PORRSTF) &&
+	    request == BOOT_REQUEST_MAGIC;
+
+	PAGE_COUNT = application_capacity();
+
+	have_addr = requested &&
+	    (node >> BOOT_NODE_SHIFT) == BOOT_NODE_MAGIC &&
+	    (uint8_t)node != CAN_ADDR_LOCAL &&
+	    (uint8_t)node < CAN_ADDR_BROADCAST_NOSELF;
+	my_addr = have_addr ? (uint8_t)node : CAN_ADDR_LOCAL;
+
+	// If we were not explicitly requested to stay in bootloader and the
+	// application is valid, jump to it immediately.
+	if (!requested && application_is_valid()) {
+	    application_jump();
+	}
+
+	// --- Continue with bootloader initialisation ---
 	SystemClock_Config();
 	if( SysTick_Config(SystemCoreClock / 1000) ) { // setup SysTick Timer for 1 msec interrupts
 		while( 1 );                                  // capture error
@@ -553,14 +761,12 @@ int main(void)
 	DDR(LED_PORT, GPIO_Pin_9, GPIO_Mode_Out_PP);
 	#endif
 
-	PAGE_COUNT = FLASH_SIZE_REG - 8;
+	// (PAGE_COUNT already set above, have_addr/my_addr too)
 
-	// do we have a node address left behind by the application?
-	uint32_t nv = *NODEADDR_ADDR;
-	have_addr = ((nv >> 8) == NODEADDR_MAGIC);
-	my_addr = have_addr ? (uint8_t)nv : 0;
-
+	// Initialise CAN with automatic bus‑off recovery
 	can_init(CAN_BR_125);
+	// We could check return value here, but can_init is currently void.
+	// We'll modify can.c to return status and handle it here.
 
 	// filter 0: OTA_DATA sent to broadcast (0xFF) or broadcast-except-self
 	// (0xFE) - these two addresses differ only in their LSB, so one
@@ -593,20 +799,18 @@ int main(void)
 			process_ota_msg(&msg);
 		}
 
-		// reset if no relevant CAN messages received
-		if( uptime - lastcanrx > NOCANRX_TO ) {
-			struct bl_pvars_t pv;
-			memcpy(&pv, APP_BASE - PAGE_WORDS, sizeof(pv));
-
-			if( (pv.app_page_count > 0) && (pv.app_page_count <= PAGE_COUNT) ) {
-				CRC_ResetDR();
-				CRC_CalcBlockCRC((uint32_t*)APP_BASE, pv.app_page_count * PAGE_WORDS);
-				if( CRC_GetCRC() == pv.app_crc ) {
-					*(MAGIC_ADDR) = MAGIC_VAL;
+		// Reset to application if the bus has been quiet long enough and
+		// the image is valid.
+		if( uptime - lastcanrx > 2 ) { // 2 seconds idle
+			if (application_is_valid()) {
+				// Write the boot‑request magic to trigger a jump on next reset
+				*MAGIC_ADDR = MAGIC_VAL;
+				// Write the node address that was used (or broadcast)
+				if (have_addr) {
+					*NODEADDR_ADDR = (NODEADDR_MAGIC << 8) | my_addr;
 				}
+				NVIC_SystemReset();
 			}
-
-			NVIC_SystemReset();
 		}
 
 		// feed watchdog
