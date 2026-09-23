@@ -14,7 +14,7 @@ BUILDDIR=build/product_$(PRODUCT_TYPE)
 # keeps product A from accepting product B's firmware on a shared bus.
 # Override per product, e.g.: make PRODUCT_TYPE=2
 # generic lighthead by default
-PRODUCT_TYPE=1
+PRODUCT_TYPE=3
 
 # STM32 stdperiph lib defines
 CDEFS=-DHSE_VALUE=8000000 -DSTM32F10X_MD -DUSE_STDPERIPH_DRIVER -DPRODUCT_TYPE=$(PRODUCT_TYPE)

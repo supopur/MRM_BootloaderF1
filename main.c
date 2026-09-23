@@ -81,8 +81,11 @@ blcan
 //  Defines
 //-----------------------------------------------------------------------------
 
-#define LED_PORT GPIOB
-#define LED_PIN GPIO_Pin_8
+#define LED_PORT GPIOA
+#define LED_PIN GPIO_Pin_5
+
+#define ERR_LED_PORT GPIOA
+#define ERR_LED_PIN GPIO_Pin_4
 
 #define TMR_ID_DELAY 0
 #define TMR_ID_LED 1
@@ -491,7 +494,7 @@ static void ota_reset(void)
 	page_off = 0;
 	cur_page = 0;
 	total_pages = 0;
-	GPIO_ResetBits(GPIOB, GPIO_Pin_9);
+	GPIO_ResetBits(ERR_LED_PORT, ERR_LED_PIN);
 }
 
 // erases+programs flash page cur_page from pagebuf (nwords words), advances
@@ -596,7 +599,7 @@ void process_ota_msg(CanRxMsg* msg)
 		}
 
 		if( page_off != PAGE_BYTES ) {
-			GPIO_SetBits(GPIOB, GPIO_Pin_9);
+			GPIO_SetBits(ERR_LED_PORT, ERR_LED_PIN);
 			ota_ack_page(op, OTA_ERR_PAGE_INCOMPLETE, cur_page);
 			page_off = 0; // discard - sender resends this whole page
 			memset(pagebuf, 0xFF, sizeof(pagebuf));
@@ -606,14 +609,14 @@ void process_ota_msg(CanRxMsg* msg)
 		CRC_ResetDR();
 		CRC_CalcBlockCRC(pagebuf, PAGE_WORDS);
 		if( CRC_GetCRC() != page_crc ) {
-			GPIO_SetBits(GPIOB, GPIO_Pin_9);
+			GPIO_SetBits(ERR_LED_PORT, ERR_LED_PIN);
 			ota_ack_page(op, OTA_ERR_PAGE_CRC, cur_page);
 			page_off = 0; // discard - sender resends this whole page
 			memset(pagebuf, 0xFF, sizeof(pagebuf));
 			return;
 		}
 
-		GPIO_ResetBits(GPIOB, GPIO_Pin_9);
+		GPIO_ResetBits(ERR_LED_PORT, ERR_LED_PIN);
 
 		if( !ota_flush_page(PAGE_WORDS) ) { // erase+program; advances cur_page on success
 			ota_ack_page(op, OTA_ERR_FLASH, cur_page);
@@ -641,7 +644,7 @@ void process_ota_msg(CanRxMsg* msg)
 
 		// Use the same validation function that we use at boot time
 		if (!application_matches(total_pages, crc)) {
-			GPIO_SetBits(GPIOB, GPIO_Pin_9);
+			GPIO_SetBits(ERR_LED_PORT, ERR_LED_PIN);
 			ota_ack(op, OTA_ERR_CRC);
 			ota_reset();
 			return;
@@ -758,7 +761,7 @@ int main(void)
 
 	#ifdef LED_PIN
 	DDR(LED_PORT, LED_PIN, GPIO_Mode_Out_PP);
-	DDR(LED_PORT, GPIO_Pin_9, GPIO_Mode_Out_PP);
+	DDR(ERR_LED_PORT, ERR_LED_PIN, GPIO_Mode_Out_PP);
 	#endif
 
 	// (PAGE_COUNT already set above, have_addr/my_addr too)
