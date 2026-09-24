@@ -133,6 +133,11 @@ static uint32_t* const MAGIC_ADDR = (uint32_t*)BOOT_REQUEST_ADDRESS;
 static uint32_t* const NODEADDR_ADDR = (uint32_t*)BOOT_NODE_ADDRESS;
 #define NODEADDR_MAGIC  0x00C0FFEEUL
 
+#define UID_BASE  0x1FFFF7E8UL   // STM32F1 unique device ID
+static uint8_t uid_byte0(void) {
+	return (uint8_t)(*(volatile uint32_t *)UID_BASE);
+}
+
 static const uint32_t* APP_BASE = (uint32_t*)BOOT_APP_ADDRESS;
 static uint16_t PAGE_COUNT;
 
@@ -464,11 +469,11 @@ void PreSystemInit(void)
 static void ota_ack_page(uint8_t op, uint8_t err, uint8_t page)
 {
 	CanTxMsg m;
-	m.StdId = CAN_MK_ID(CAN_ADDR_BROADCAST, CAN_MSGTYPE_SLAVE_OUT);
+	m.StdId = CAN_MK_ID(CAN_MSGTYPE_SLAVE_OUT, CAN_ADDR_BROADCAST);
 	m.IDE = CAN_Id_Standard;
 	m.RTR = CAN_RTR_Data;
 	m.DLC = 4;
-	m.Data[0] = have_addr ? my_addr : CAN_ADDR_BROADCAST;
+	m.Data[0] = have_addr ? my_addr : uid_byte0();
 	m.Data[1] = op;
 	m.Data[2] = err;
 	m.Data[3] = page;
@@ -478,11 +483,11 @@ static void ota_ack_page(uint8_t op, uint8_t err, uint8_t page)
 static void ota_ack(uint8_t op, uint8_t err)
 {
 	CanTxMsg m;
-	m.StdId = CAN_MK_ID(CAN_ADDR_BROADCAST, CAN_MSGTYPE_SLAVE_OUT);
+	m.StdId = CAN_MK_ID(CAN_MSGTYPE_SLAVE_OUT, CAN_ADDR_BROADCAST);
 	m.IDE = CAN_Id_Standard;
 	m.RTR = CAN_RTR_Data;
 	m.DLC = 3;
-	m.Data[0] = have_addr ? my_addr : CAN_ADDR_BROADCAST;
+	m.Data[0] = have_addr ? my_addr : uid_byte0();
 	m.Data[1] = op;
 	m.Data[2] = err;
 	can_tx(&m);
@@ -526,8 +531,8 @@ void process_ota_msg(CanRxMsg* msg)
 	if( op == OTA_OP_INFO ) {
 		if( msg->DLC < 3 ) return;
 		uint8_t prod = msg->Data[1];
-		uint8_t pc = msg->Data[2];
-		// Validate product and size first
+		uint8_t pc   = msg->Data[2];
+
 		if( prod != PRODUCT_TYPE ) {
 			ota_ack(op, OTA_ERR_PRODUCT);
 			return;
@@ -536,16 +541,21 @@ void process_ota_msg(CanRxMsg* msg)
 			ota_ack(op, OTA_ERR_SIZE);
 			return;
 		}
-		// Reset state and invalidate old metadata before accepting new image
+
 		ota_reset();
-		if (!application_invalidate()) {
-			ota_ack(op, OTA_ERR_FLASH);
-			return;
-		}
 		total_pages = pc;
-		ota_active = 1;
+		ota_active  = 1;
 		memset(pagebuf, 0xFF, sizeof(pagebuf));
+
+		// ACK *first* so the host records us as participating before we
+		// spend up to ~20 ms erasing the metadata page.
 		ota_ack(op, OTA_ERR_OK);
+
+		// Now erase the old metadata. If this fails we can no longer
+		// accept OTA_OP_END cleanly, but the host will find out then.
+		// Do NOT ota_reset() here on failure - we're already committed
+		// to participating; the END handler will catch it.
+		application_invalidate();
 		return;
 	}
 
@@ -774,11 +784,11 @@ int main(void)
 	// filter 0: OTA_DATA sent to broadcast (0xFF) or broadcast-except-self
 	// (0xFE) - these two addresses differ only in their LSB, so one
 	// mask-based filter catches both.
-	can_filter(CAN_MK_ID(CAN_ADDR_BROADCAST_NOSELF, CAN_MSGTYPE_OTA_DATA), 0x7F7, 0);
+	can_filter(CAN_MK_ID(CAN_MSGTYPE_OTA_DATA, CAN_ADDR_BROADCAST_NOSELF), 0x7FE, 0);
 
 	// filter 1: OTA_DATA sent to our own address, if we have one
 	if( have_addr ) {
-		can_filter(CAN_MK_ID(my_addr, CAN_MSGTYPE_OTA_DATA), 0x7FF, 1);
+		can_filter(CAN_MK_ID(CAN_MSGTYPE_OTA_DATA, my_addr), 0x7FF, 1);
 	}
 
 	tmr_set(TMR_ID_LED, 100);

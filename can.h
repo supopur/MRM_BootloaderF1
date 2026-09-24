@@ -32,9 +32,9 @@
 #define CAN_MSGTYPE_SLAVE_OUT 0x03 // slave -> master/slaves, Data[0] = sub-message id
 #define CAN_MSGTYPE_TIME_SYNC 0x05 // best-effort light/siren sync
 
-#define CAN_MK_ID(target, msgtype) ((uint32_t)(((uint32_t)(target) << 3) | ((msgtype) & 0x07)))
-#define CAN_ID_TARGET(id) ((uint8_t)((id) >> 3))
-#define CAN_ID_MSGTYPE(id) ((uint8_t)((id) & 0x07))
+#define CAN_MK_ID(type, addr)  (((uint16_t)((type) & 0x07) << 8) | ((addr) & 0xFF))
+#define CAN_ID_TARGET(id)   ((id) & 0xFF)
+#define CAN_ID_MSGTYPE(id)  (((id) >> 8) & 0x07)
 
 void can_init(uint16_t br);
 
