@@ -36,7 +36,7 @@
 #define CAN_ID_TARGET(id)   ((id) & 0xFF)
 #define CAN_ID_MSGTYPE(id)  (((id) >> 8) & 0x07)
 
-void can_init(uint16_t br);
+uint8_t can_init(uint16_t br);
 
 // id/msk are plain 11-bit standard IDs (NOT pre-shifted into the filter
 // register layout - can_filter() does that internally). Only ever matches

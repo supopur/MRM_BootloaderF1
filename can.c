@@ -46,9 +46,9 @@ uint8_t can_init(uint16_t br)
 	cnis.CAN_TTCM = DISABLE;
 	cnis.CAN_ABOM = ENABLE;      // automatic bus‑off recovery
 	cnis.CAN_AWUM = DISABLE;
-	cnis.CAN_NART = ENABLE;
+	cnis.CAN_NART = DISABLE;     // Enable automatic retransmission for arbitration
 	cnis.CAN_RFLM = DISABLE;
-	cnis.CAN_TXFP = DISABLE;
+	cnis.CAN_TXFP = ENABLE;      // Transmit in chronological request order
 	cnis.CAN_Mode = CAN_Mode_Normal;
 	cnis.CAN_SJW = CAN_SJW_1tq;
 	cnis.CAN_BS1 = CAN_BS1_3tq;
@@ -90,12 +90,19 @@ uint8_t can_tx(CanTxMsg* msg)
 {
 	uint8_t mailbox = CAN_Transmit(CAN1, msg);
 	if (mailbox == CAN_TxStatus_NoMailBox) return 0;
-	// Wait for transmission to complete or time out (simple implementation)
+
 	uint32_t timeout = 0xFFFF;
-	while (!(CAN_TransmitStatus(CAN1, mailbox) & CAN_TxStatus_Failed) && timeout--) {
-		if (CAN_TransmitStatus(CAN1, mailbox) & CAN_TxStatus_Ok) return 1;
+	while (timeout--) {
+		uint8_t status = CAN_TransmitStatus(CAN1, mailbox);
+		if (status == CAN_TxStatus_Ok) {
+			return 1;
+		}
+		if (status == CAN_TxStatus_Failed) {
+			return 0;
+		}
 	}
-	return 0; // timed out or failed
+	CAN_CancelTransmit(CAN1, mailbox);
+	return 0; // timed out
 }
 
 uint8_t can_rx(CanRxMsg* msg)

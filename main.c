@@ -128,14 +128,19 @@ typedef struct {
 // Constants
 //-----------------------------------------------------------------------------
 
-static const uint32_t MAGIC_VAL = BOOT_REQUEST_MAGIC;
 static uint32_t* const MAGIC_ADDR = (uint32_t*)BOOT_REQUEST_ADDRESS;
 static uint32_t* const NODEADDR_ADDR = (uint32_t*)BOOT_NODE_ADDRESS;
 #define NODEADDR_MAGIC  0x00C0FFEEUL
 
 #define UID_BASE  0x1FFFF7E8UL   // STM32F1 unique device ID
 static uint8_t uid_byte0(void) {
-	return (uint8_t)(*(volatile uint32_t *)UID_BASE);
+	volatile const uint32_t *uid = (volatile const uint32_t *)UID_BASE;
+	uint32_t w = uid[0] ^ uid[1] ^ uid[2];
+	uint8_t b = (uint8_t)(w ^ (w >> 8) ^ (w >> 16) ^ (w >> 24));
+	if (b == CAN_ADDR_LOCAL || b >= CAN_ADDR_BROADCAST_NOSELF) {
+		b = 1 + (b % 0xFD);
+	}
+	return b;
 }
 
 static const uint32_t* APP_BASE = (uint32_t*)BOOT_APP_ADDRESS;
@@ -186,6 +191,7 @@ static uint16_t page_off;    // bytes filled in pagebuf so far
 static uint8_t cur_page;     // next page index to write
 static uint8_t total_pages;  // expected page count for this update (from INFO)
 static uint8_t ota_active;   // set once a valid INFO has been received
+static uint8_t ota_finished; // set once OTA_OP_END succeeds and metadata is verified
 
 //-----------------------------------------------------------------------------
 //  newlib required functions
@@ -328,9 +334,12 @@ static uint16_t application_capacity(void)
 {
     uint16_t flashSize_kib = flash_size_kib();
 
-    if (flashSize_kib != BOOT_C6_FLASH_KIB &&
-        flashSize_kib != BOOT_C8_FLASH_KIB) {
-        return 0;
+    // Default safely to 64 KiB if register is 0, 0xFFFF, or < BOOT_RESERVED_KIB (e.g. clones or unprogrammed option bytes)
+    if (flashSize_kib == 0 || flashSize_kib == 0xFFFF || flashSize_kib < BOOT_RESERVED_KIB) {
+        flashSize_kib = BOOT_C8_FLASH_KIB;
+    } else if (flashSize_kib > 128) {
+        // Medium density STM32F10x devices have max 128 KiB flash
+        flashSize_kib = 128;
     }
 
     return flashSize_kib - BOOT_RESERVED_KIB;
@@ -350,7 +359,7 @@ static uint8_t application_matches(uint32_t pageCount, uint32_t crc)
         return 0;
     }
 
-    ramBytes = flash_size_kib() == BOOT_C6_FLASH_KIB ?
+    ramBytes = (flash_size_kib() == BOOT_C6_FLASH_KIB) ?
         BOOT_C6_RAM_BYTES : BOOT_C8_RAM_BYTES;
     imageEnd = BOOT_APP_ADDRESS + pageCount * BOOT_PAGE_BYTES;
     stack = p_vectors[0];
@@ -469,11 +478,12 @@ void PreSystemInit(void)
 static void ota_ack_page(uint8_t op, uint8_t err, uint8_t page)
 {
 	CanTxMsg m;
-	m.StdId = CAN_MK_ID(CAN_MSGTYPE_SLAVE_OUT, CAN_ADDR_BROADCAST);
+	uint8_t src_addr = have_addr ? my_addr : uid_byte0();
+	m.StdId = CAN_MK_ID(CAN_MSGTYPE_SLAVE_OUT, src_addr);
 	m.IDE = CAN_Id_Standard;
 	m.RTR = CAN_RTR_Data;
 	m.DLC = 4;
-	m.Data[0] = have_addr ? my_addr : uid_byte0();
+	m.Data[0] = src_addr;
 	m.Data[1] = op;
 	m.Data[2] = err;
 	m.Data[3] = page;
@@ -483,11 +493,12 @@ static void ota_ack_page(uint8_t op, uint8_t err, uint8_t page)
 static void ota_ack(uint8_t op, uint8_t err)
 {
 	CanTxMsg m;
-	m.StdId = CAN_MK_ID(CAN_MSGTYPE_SLAVE_OUT, CAN_ADDR_BROADCAST);
+	uint8_t src_addr = have_addr ? my_addr : uid_byte0();
+	m.StdId = CAN_MK_ID(CAN_MSGTYPE_SLAVE_OUT, src_addr);
 	m.IDE = CAN_Id_Standard;
 	m.RTR = CAN_RTR_Data;
 	m.DLC = 3;
-	m.Data[0] = have_addr ? my_addr : uid_byte0();
+	m.Data[0] = src_addr;
 	m.Data[1] = op;
 	m.Data[2] = err;
 	can_tx(&m);
@@ -496,6 +507,7 @@ static void ota_ack(uint8_t op, uint8_t err)
 static void ota_reset(void)
 {
 	ota_active = 0;
+	ota_finished = 0;
 	page_off = 0;
 	cur_page = 0;
 	total_pages = 0;
@@ -566,8 +578,8 @@ void process_ota_msg(CanRxMsg* msg)
 		// worth of frames back-to-back at full CAN rate.
 		if( !ota_active ) return;
 		if( cur_page >= total_pages ) {
-			ota_ack(op, OTA_ERR_OVERFLOW); // sender bug - it kept going past total_pages
-			ota_reset();
+			// Already received and flushed all pages for this update;
+			// ignore any retried data meant for other devices on broadcast.
 			return;
 		}
 
@@ -682,6 +694,7 @@ void process_ota_msg(CanRxMsg* msg)
 		// Do NOT reset immediately – let the host receive the ACK.
 		// The existing idle‑timeout will trigger a reset.
 		ota_reset(); // clear active state but keep the written image valid
+		ota_finished = 1;
 		return;
 	}
 
@@ -726,20 +739,15 @@ int main(void)
 	volatile uint32_t *p_node =
 	    (volatile uint32_t *)BOOT_NODE_ADDRESS;
 
-	uint32_t resetFlags = RCC->CSR;
 	uint32_t request = *p_request;
 	uint32_t node = *p_node;
 
 	// Clear the request magic so it is not reused
 	*p_request = 0;
-	*p_node = 0;
 	__DSB();
 	RCC_ClearFlag();
 
-	uint8_t requested =
-	    (resetFlags & RCC_CSR_SFTRSTF) &&
-	    !(resetFlags & RCC_CSR_PORRSTF) &&
-	    request == BOOT_REQUEST_MAGIC;
+	uint8_t requested = (request == BOOT_REQUEST_MAGIC);
 
 	PAGE_COUNT = application_capacity();
 
@@ -747,7 +755,7 @@ int main(void)
 	    (node >> BOOT_NODE_SHIFT) == BOOT_NODE_MAGIC &&
 	    (uint8_t)node != CAN_ADDR_LOCAL &&
 	    (uint8_t)node < CAN_ADDR_BROADCAST_NOSELF;
-	my_addr = have_addr ? (uint8_t)node : CAN_ADDR_LOCAL;
+	my_addr = have_addr ? (uint8_t)node : uid_byte0();
 
 	// If we were not explicitly requested to stay in bootloader and the
 	// application is valid, jump to it immediately.
@@ -778,18 +786,14 @@ int main(void)
 
 	// Initialise CAN with automatic bus‑off recovery
 	can_init(CAN_BR_125);
-	// We could check return value here, but can_init is currently void.
-	// We'll modify can.c to return status and handle it here.
 
 	// filter 0: OTA_DATA sent to broadcast (0xFF) or broadcast-except-self
 	// (0xFE) - these two addresses differ only in their LSB, so one
 	// mask-based filter catches both.
 	can_filter(CAN_MK_ID(CAN_MSGTYPE_OTA_DATA, CAN_ADDR_BROADCAST_NOSELF), 0x7FE, 0);
 
-	// filter 1: OTA_DATA sent to our own address, if we have one
-	if( have_addr ) {
-		can_filter(CAN_MK_ID(CAN_MSGTYPE_OTA_DATA, my_addr), 0x7FF, 1);
-	}
+	// filter 1: OTA_DATA sent to our own address (or UID if unconfigured)
+	can_filter(CAN_MK_ID(CAN_MSGTYPE_OTA_DATA, my_addr), 0x7FF, 1);
 
 	tmr_set(TMR_ID_LED, 100);
 
@@ -808,20 +812,23 @@ int main(void)
 
 		// Process CAN messages
 		CanRxMsg msg;
-		if( can_rx(&msg) ) {
+		while( can_rx(&msg) ) {
 			process_ota_msg(&msg);
 		}
 
-		// Reset to application if the bus has been quiet long enough and
-		// the image is valid.
-		if( uptime - lastcanrx > 2 ) { // 2 seconds idle
+		// Reset to application once update is finished and bus is quiet (1 second idle),
+		// OR if requested into bootloader but flasher never started within 15 seconds.
+		if( ota_finished && (uptime - lastcanrx >= 1) ) {
 			if (application_is_valid()) {
-				// Write the boot‑request magic to trigger a jump on next reset
-				*MAGIC_ADDR = MAGIC_VAL;
-				// Write the node address that was used (or broadcast)
+				*MAGIC_ADDR = 0; // Clear magic so next boot executes the application
 				if (have_addr) {
 					*NODEADDR_ADDR = (NODEADDR_MAGIC << 8) | my_addr;
 				}
+				NVIC_SystemReset();
+			}
+		} else if( requested && !ota_active && !ota_finished && (uptime - lastcanrx > 15) ) {
+			if (application_is_valid()) {
+				*MAGIC_ADDR = 0;
 				NVIC_SystemReset();
 			}
 		}
